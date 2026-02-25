@@ -278,5 +278,19 @@ class DebugLogger:
         except Exception as e:
             self.logger.error(f"Error logging warning: {e}")
 
+    def log_runtime(self, message: str):
+        """Always-on runtime log (not gated by debug_enabled)."""
+        try:
+            self.logger.info(f"🧭 [{self._format_timestamp()}] {message}")
+        except Exception as e:
+            self.logger.error(f"Error logging runtime info: {e}")
+
+    def log_runtime_warning(self, message: str):
+        """Always-on runtime warning log (not gated by debug_enabled)."""
+        try:
+            self.logger.warning(f"🚨 [{self._format_timestamp()}] {message}")
+        except Exception as e:
+            self.logger.error(f"Error logging runtime warning: {e}")
+
 # Global debug logger instance
 debug_logger = DebugLogger()

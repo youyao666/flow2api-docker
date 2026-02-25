@@ -447,16 +447,22 @@ class BrowserCaptchaService:
             page_key = None
 
         # key/action 候选（去重并保序）
+        # 关键点：优先使用后端配置的 website_key，避免页面上其他 key 干扰
         key_candidates = []
-        if page_key:
-            key_candidates.append(page_key)
-        if self.website_key and self.website_key not in key_candidates:
+        if self.website_key:
             key_candidates.append(self.website_key)
+        if page_key and page_key not in key_candidates:
+            key_candidates.append(page_key)
 
+        # 关键点：action 必须严格匹配当前业务场景，避免拿到“可执行但无效”的 token
+        # 优先使用调用方传入 action，仅在为空时回退到 page_action/IMAGE_GENERATION。
         action_candidates = []
-        for candidate in [action, self.page_action, "IMAGE_GENERATION", "VIDEO_GENERATION", "GENERATE", "GENERATION"]:
-            if candidate and candidate not in action_candidates:
-                action_candidates.append(candidate)
+        strict_action = (action or "").strip()
+        if strict_action:
+            action_candidates.append(strict_action)
+        else:
+            fallback_action = (self.page_action or "").strip() or "IMAGE_GENERATION"
+            action_candidates.append(fallback_action)
 
         # 尝试不同 key + action 组合
         for key in key_candidates:
@@ -695,11 +701,31 @@ class BrowserCaptchaService:
                 return None
             
             # 关键诊断：确认未被重定向到登录页等非项目页
+            # 若出现 about:blank 等异常上下文，主动二次跳转一次，避免后续拿到无效 token。
             try:
                 href = await tab.evaluate("location.href")
                 if '/fx/tools/flow/project/' not in (href or ''):
                     print(f"[BrowserCaptcha][RESIDENT_CTX] unexpected href after load: {href}")
-                    debug_logger.log_warning(f"[BrowserCaptcha] 常驻页上下文异常: {href}")
+                    debug_logger.log_warning(f"[BrowserCaptcha] 常驻页上下文异常: {href}，尝试二次跳转")
+                    try:
+                        await tab.get(website_url)
+                        await asyncio.sleep(2)
+                        href2 = await tab.evaluate("location.href")
+                        if '/fx/tools/flow/project/' not in (href2 or ''):
+                            print(f"[BrowserCaptcha][RESIDENT_CTX] still invalid after retry: {href2}")
+                            debug_logger.log_warning(f"[BrowserCaptcha] 常驻页二次跳转后仍异常: {href2}")
+                            try:
+                                await tab.close()
+                            except:
+                                pass
+                            return None
+                    except Exception as nav_err:
+                        debug_logger.log_warning(f"[BrowserCaptcha] 常驻页二次跳转异常: {nav_err}")
+                        try:
+                            await tab.close()
+                        except:
+                            pass
+                        return None
             except Exception:
                 pass
 
