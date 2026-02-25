@@ -5,8 +5,11 @@
 import os
 import sys
 import subprocess
-# 修复 Windows 上 playwright 的 asyncio 兼容性问题
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+# 仅在 Windows 上固定 Playwright 浏览器路径。
+# 在 Linux/Docker 中强制为 "0" 会导致无法识别镜像构建阶段已安装的浏览器，
+# 从而在启动时反复执行安装并阻塞服务可用性。
+if os.name == "nt":
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
 import asyncio
 import time
@@ -399,6 +402,11 @@ class TokenBrowser:
             context = await browser.new_context(
                 user_agent=random_ua,
                 viewport=viewport,
+                locale="en-US",
+                timezone_id="Asia/Shanghai",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+                },
             )
             return playwright, browser, context
         except Exception as e:
@@ -431,53 +439,158 @@ class TokenBrowser:
         try:
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-            
+
             page_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-            
-            async def handle_route(route):
-                if route.request.url.rstrip('/') == page_url.rstrip('/'):
-                    html = f"""<html><head><script src="https://www.google.com/recaptcha/enterprise.js?render={website_key}"></script></head><body></body></html>"""
-                    await route.fulfill(status=200, content_type="text/html", body=html)
-                elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net"]):
-                    await route.continue_()
-                else:
-                    await route.abort()
-            
-            await page.route("**/*", handle_route)
             try:
-                await page.goto(page_url, wait_until="load", timeout=30000)
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=12000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(800)
+                # 尽量把页面置于“可交互”状态，减少 execute 场景差异
+                await page.evaluate(
+                    """
+                    () => {
+                        try { window.focus(); } catch (e) {}
+                        try { document.dispatchEvent(new Event('mousemove')); } catch (e) {}
+                        try { document.dispatchEvent(new Event('visibilitychange')); } catch (e) {}
+                        return {
+                            href: location.href,
+                            ready: document.readyState,
+                            visibility: document.visibilityState,
+                            hasEnterprise: !!(window.grecaptcha && grecaptcha.enterprise),
+                        };
+                    }
+                    """
+                )
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} page.goto 失败: {type(e).__name__}: {str(e)[:200]}")
                 return None
-            
-            try:
-                await page.wait_for_function("typeof grecaptcha !== 'undefined'", timeout=15000)
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} grecaptcha 未就绪: {type(e).__name__}: {str(e)[:200]}")
-                return None
-            
-            token = await asyncio.wait_for(
-                page.evaluate(f"""
-                    (actionName) => {{
-                        return new Promise((resolve, reject) => {{
-                            const timeout = setTimeout(() => reject(new Error('timeout')), 25000);
-                            grecaptcha.enterprise.execute('{website_key}', {{action: actionName}})
-                                .then(t => {{ resolve(t); }})
-                                .catch(e => {{ reject(e); }});
-                        }});
+
+            # 优先动态提取页面中的 render key，再回退到默认 key
+            extracted_keys = await page.evaluate("""
+                () => {
+                    const keys = [];
+                    const seen = new Set();
+                    const scripts = Array.from(document.querySelectorAll('script[src]'));
+                    for (const s of scripts) {
+                        const src = s.getAttribute('src') || '';
+                        if ((src.includes('recaptcha/enterprise.js') || src.includes('recaptcha/api.js')) && src.includes('render=')) {
+                            const m = src.match(/[?&]render=([^&]+)/);
+                            if (m && m[1]) {
+                                const k = decodeURIComponent(m[1]);
+                                if (!seen.has(k)) {
+                                    seen.add(k);
+                                    keys.push(k);
+                                }
+                            }
+                        }
+                    }
+                    return keys;
+                }
+            """)
+
+            key_candidates = []
+            for k in (extracted_keys or []):
+                if k and k not in key_candidates:
+                    key_candidates.append(k)
+            if website_key and website_key not in key_candidates:
+                key_candidates.append(website_key)
+
+            if not key_candidates:
+                key_candidates = [website_key]
+
+            # 确保 grecaptcha.enterprise 可用（必要时主动注入）
+            for key in key_candidates:
+                is_ready = await page.evaluate(
+                    "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
+                )
+                if is_ready:
+                    break
+                await page.evaluate(f"""
+                    ([siteKey]) => {{
+                        try {{
+                            const wanted = `https://www.google.com/recaptcha/enterprise.js?render=${{encodeURIComponent(siteKey)}}`;
+                            const exists = Array.from(document.querySelectorAll('script[src]')).some(s =>
+                                (s.getAttribute('src') || '').includes('recaptcha/enterprise.js') &&
+                                (s.getAttribute('src') || '').includes(`render=${{encodeURIComponent(siteKey)}}`)
+                            );
+                            if (!exists) {{
+                                const s = document.createElement('script');
+                                s.src = wanted;
+                                s.async = true;
+                                document.head.appendChild(s);
+                            }}
+                        }} catch (e) {{}}
                     }}
-                """, action),
-                timeout=30
-            )
-            return token
+                """, [key])
+                try:
+                    await page.wait_for_function(
+                        "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'",
+                        timeout=20000
+                    )
+                    break
+                except Exception:
+                    continue
+
+            action_candidates = []
+            for candidate in [action, "IMAGE_GENERATION", "VIDEO_GENERATION", "GENERATE", "GENERATION"]:
+                if candidate and candidate not in action_candidates:
+                    action_candidates.append(candidate)
+
+            for key in key_candidates:
+                for action_name in action_candidates:
+                    try:
+                        token = await asyncio.wait_for(
+                            page.evaluate(
+                                """
+                                ([siteKey, actionName]) => {
+                                    return new Promise((resolve, reject) => {
+                                        const t = setTimeout(() => reject(new Error('timeout')), 25000);
+                                        try {
+                                            grecaptcha.enterprise.ready(() => {
+                                                grecaptcha.enterprise.execute(siteKey, { action: actionName })
+                                                    .then((val) => { clearTimeout(t); resolve(val); })
+                                                    .catch((err) => { clearTimeout(t); reject(err); });
+                                            });
+                                        } catch (e) {
+                                            clearTimeout(t);
+                                            reject(e);
+                                        }
+                                    });
+                                }
+                                """,
+                                [key, action_name]
+                            ),
+                            timeout=30
+                        )
+                        if token and isinstance(token, str) and len(token) > 80:
+                            debug_logger.log_info(
+                                f"[BrowserCaptcha] Token-{self.token_id} 打码成功 (key={key[:8]}..., action={action_name}, len={len(token)})"
+                            )
+                            return token
+                        if token:
+                            debug_logger.log_warning(
+                                f"[BrowserCaptcha] Token-{self.token_id} 打码返回疑似无效短 token (key={key[:8]}..., action={action_name}, len={len(token)})"
+                            )
+                    except Exception as e:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] Token-{self.token_id} 打码组合失败 (key={key[:8]}..., action={action_name}): {type(e).__name__}: {str(e)[:120]}"
+                        )
+                        continue
+
+            return None
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)}"
             debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} 打码失败: {msg[:200]}")
             return None
         finally:
             if page:
-                try: await page.close()
-                except: pass
+                try:
+                    await page.close()
+                except:
+                    pass
     
     async def get_token(self, project_id: str, website_key: str, action: str = "IMAGE_GENERATION") -> Optional[str]:
         """获取 Token：启动新浏览器 -> 打码 -> 关闭浏览器"""
@@ -531,6 +644,7 @@ class BrowserCaptchaService:
     def __init__(self, db=None):
         self.db = db
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        self.page_action = "IMAGE_GENERATION"
         self.base_user_data_dir = os.path.join(os.getcwd(), "browser_data_rt")
         self._browsers: Dict[int, TokenBrowser] = {}
         self._browsers_lock = asyncio.Lock()
@@ -575,14 +689,21 @@ class BrowserCaptchaService:
             )
     
     async def _load_browser_count(self):
-        """从数据库加载浏览器数量配置"""
+        """从数据库加载打码配置（浏览器数量 / website_key / page_action）"""
         if self.db:
             try:
                 captcha_config = await self.db.get_captcha_config()
                 self._browser_count = max(1, captcha_config.browser_count)
-                debug_logger.log_info(f"[BrowserCaptcha] 浏览器数量配置: {self._browser_count}")
+                if getattr(captcha_config, "website_key", None):
+                    self.website_key = captcha_config.website_key
+                if getattr(captcha_config, "page_action", None):
+                    self.page_action = captcha_config.page_action
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 配置加载: browser_count={self._browser_count}, "
+                    f"website_key={self.website_key[:8]}..., page_action={self.page_action}"
+                )
             except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] 加载 browser_count 配置失败: {e}，使用默认值 1")
+                debug_logger.log_warning(f"[BrowserCaptcha] 加载 captcha 配置失败: {e}，使用默认配置")
                 self._browser_count = 1
         # 并发限制 = 浏览器数量，不再硬编码限制
         self._token_semaphore = asyncio.Semaphore(self._browser_count)
@@ -642,6 +763,8 @@ class BrowserCaptchaService:
         """
         # 检查服务是否可用
         self._check_available()
+
+        action = action or self.page_action
         
         self._stats["req_total"] += 1
         

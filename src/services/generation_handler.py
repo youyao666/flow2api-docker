@@ -916,6 +916,15 @@ class GenerationHandler:
 
         if not token:
             error_msg = self._get_no_token_error_message(generation_type)
+            # 追加最近一次负载均衡过滤报告，便于线上快速定位「无可用Token」原因
+            if hasattr(self.load_balancer, "get_last_filter_report"):
+                try:
+                    filter_report = self.load_balancer.get_last_filter_report()
+                    if filter_report:
+                        error_msg = f"{error_msg} | 过滤详情: {filter_report}"
+                except Exception as _report_err:
+                    debug_logger.log_warning(f"[GENERATION] 获取过滤报告失败: {_report_err}")
+
             debug_logger.log_error(f"[GENERATION] {error_msg}")
             if stream:
                 yield self._create_stream_chunk(f"❌ {error_msg}\n")
@@ -1031,8 +1040,19 @@ class GenerationHandler:
             if stream:
                 yield self._create_stream_chunk(f"❌ {error_msg}\n")
             if token:
-                # 记录错误（所有错误统一处理，不再特殊处理429）
-                await self.token_manager.record_error(token.id)
+                # reCAPTCHA 失败不计入 token 连续错误，避免误触发自动禁用
+                # （这类错误多为打码链路波动，不代表账号 token 本身失效）
+                lower_msg = error_msg.lower()
+                is_captcha_error = (
+                    "recaptcha" in lower_msg
+                    or "captcha" in lower_msg
+                    or "public_error_something_went_wrong" in lower_msg
+                )
+                if is_captcha_error:
+                    debug_logger.log_warning(f"[GENERATION] 跳过 token 错误计数（reCAPTCHA 类错误）: token={token.id}")
+                else:
+                    # 记录错误（非打码类错误才计入自动禁用阈值）
+                    await self.token_manager.record_error(token.id)
             yield self._create_error_response(error_msg)
 
             # 记录失败日志

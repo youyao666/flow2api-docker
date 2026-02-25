@@ -1235,47 +1235,105 @@ class FlowClient:
         """
         captcha_method = config.captcha_method
 
+        # 运行时打码参数（优先数据库热配置）
+        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        effective_action = action
+        if self.db:
+            try:
+                captcha_config = await self.db.get_captcha_config()
+                if getattr(captcha_config, "website_key", None):
+                    website_key = captcha_config.website_key
+                if getattr(captcha_config, "page_action", None):
+                    effective_action = captcha_config.page_action
+            except Exception as e:
+                debug_logger.log_warning(f"[reCAPTCHA] 读取运行时 captcha 配置失败，使用默认值: {e}")
+
+        debug_logger.log_info(
+            f"[reCAPTCHA] method={captcha_method}, project={project_id}, "
+            f"action_req={action}, action_eff={effective_action}, key={website_key[:8]}..."
+        )
+
         # 内置浏览器打码 (nodriver)
         if captcha_method == "personal":
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
-                return await service.get_token(project_id, action), None
+                if hasattr(service, "website_key"):
+                    service.website_key = website_key
+                if hasattr(service, "page_action"):
+                    service.page_action = effective_action
+                token = await service.get_token(project_id, effective_action)
+                if token:
+                    return token, None
+                debug_logger.log_warning("[reCAPTCHA Personal] 未获取到token，自动回退到 browser 模式")
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
                 debug_logger.log_error(f"[reCAPTCHA Personal] {error_msg}")
                 print(f"[reCAPTCHA] ❌ 内置浏览器打码失败: {error_msg}")
-                return None, None
+                debug_logger.log_warning("[reCAPTCHA Personal] 自动回退到 browser 模式")
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 导入失败: {str(e)}")
                 print(f"[reCAPTCHA] ❌ nodriver 未安装，请运行: pip install nodriver")
-                return None, None
+                debug_logger.log_warning("[reCAPTCHA Personal] 自动回退到 browser 模式")
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 错误: {str(e)}")
+                debug_logger.log_warning("[reCAPTCHA Personal] 自动回退到 browser 模式")
+
+            # personal 失败后自动回退到 playwright browser
+            try:
+                from .browser_captcha import BrowserCaptchaService as PlaywrightCaptchaService
+                service = await PlaywrightCaptchaService.get_instance(self.db)
+                if hasattr(service, "website_key"):
+                    service.website_key = website_key
+                if hasattr(service, "page_action"):
+                    service.page_action = effective_action
+                return await service.get_token(project_id, effective_action)
+            except Exception as fallback_err:
+                debug_logger.log_error(f"[reCAPTCHA Fallback->Browser] 错误: {str(fallback_err)}")
                 return None, None
-        # 有头浏览器打码 (playwright)
+
+        # browser 模式：先用 playwright，失败后再回退 personal
         elif captcha_method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
-                return await service.get_token(project_id, action)
+                if hasattr(service, "website_key"):
+                    service.website_key = website_key
+                if hasattr(service, "page_action"):
+                    service.page_action = effective_action
+                token, browser_id = await service.get_token(project_id, effective_action)
+                if token:
+                    return token, browser_id
+                debug_logger.log_warning("[reCAPTCHA Browser] 未获取到token，自动回退到 personal 模式")
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
                 debug_logger.log_error(f"[reCAPTCHA Browser] {error_msg}")
                 print(f"[reCAPTCHA] ❌ 有头浏览器打码失败: {error_msg}")
-                return None, None
+                debug_logger.log_warning("[reCAPTCHA Browser] 自动回退到 personal 模式")
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] 导入失败: {str(e)}")
                 print(f"[reCAPTCHA] ❌ playwright 未安装，请运行: pip install playwright && python -m playwright install chromium")
-                return None, None
+                debug_logger.log_warning("[reCAPTCHA Browser] 自动回退到 personal 模式")
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] 错误: {str(e)}")
+                debug_logger.log_warning("[reCAPTCHA Browser] 自动回退到 personal 模式")
+
+            try:
+                from .browser_captcha_personal import BrowserCaptchaService as PersonalCaptchaService
+                service = await PersonalCaptchaService.get_instance(self.db)
+                if hasattr(service, "website_key"):
+                    service.website_key = website_key
+                if hasattr(service, "page_action"):
+                    service.page_action = effective_action
+                return await service.get_token(project_id, effective_action), None
+            except Exception as fallback_err:
+                debug_logger.log_error(f"[reCAPTCHA Fallback->Personal] 错误: {str(fallback_err)}")
                 return None, None
         # API打码服务
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
-            token = await self._get_api_captcha_token(captcha_method, project_id, action)
+            token = await self._get_api_captcha_token(captcha_method, project_id, effective_action)
             return token, None
         else:
             debug_logger.log_info(f"[reCAPTCHA] 未知的打码方式: {captcha_method}")
@@ -1317,6 +1375,17 @@ class FlowClient:
         website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
         page_action = action
+
+        # 优先使用数据库中的动态配置（若存在）
+        if self.db:
+            try:
+                captcha_config = await self.db.get_captcha_config()
+                if getattr(captcha_config, "website_key", None):
+                    website_key = captcha_config.website_key
+                if getattr(captcha_config, "page_action", None):
+                    page_action = action or captcha_config.page_action
+            except Exception as e:
+                debug_logger.log_warning(f"[reCAPTCHA {method}] 读取动态配置失败，继续使用默认值: {e}")
 
         try:
             async with AsyncSession() as session:

@@ -1,6 +1,6 @@
 """Load balancing module for Flow2API"""
 import random
-from typing import Optional
+from typing import Optional, Dict, Any
 from ..core.models import Token
 from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
@@ -12,6 +12,11 @@ class LoadBalancer:
     def __init__(self, token_manager, concurrency_manager: Optional[ConcurrencyManager] = None):
         self.token_manager = token_manager
         self.concurrency_manager = concurrency_manager
+        self._last_filter_report: Dict[str, Any] = {}
+
+    def get_last_filter_report(self) -> Dict[str, Any]:
+        """获取最近一次 Token 选择的过滤报告（用于诊断无可用 Token 问题）"""
+        return self._last_filter_report.copy()
 
     async def select_token(
         self,
@@ -35,7 +40,17 @@ class LoadBalancer:
         active_tokens = await self.token_manager.get_active_tokens()
         debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token")
 
+        self._last_filter_report = {
+            "active_token_count": len(active_tokens),
+            "for_image_generation": for_image_generation,
+            "for_video_generation": for_video_generation,
+            "model": model,
+            "filtered_reasons": {},
+            "available_token_ids": []
+        }
+
         if not active_tokens:
+            self._last_filter_report["summary"] = "NO_ACTIVE_TOKENS"
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
             return None
 
@@ -79,11 +94,18 @@ class LoadBalancer:
             for token_id, reason in filtered_reasons.items():
                 debug_logger.log_info(f"[LOAD_BALANCER]   - Token {token_id}: {reason}")
 
+        self._last_filter_report["filtered_reasons"] = {str(k): v for k, v in filtered_reasons.items()}
+
         if not available_tokens:
+            self._last_filter_report["summary"] = "NO_AVAILABLE_TOKENS"
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有可用的Token (图片生成={for_image_generation}, 视频生成={for_video_generation})")
             return None
 
+        self._last_filter_report["summary"] = "TOKEN_SELECTED"
+        self._last_filter_report["available_token_ids"] = [token.id for token in available_tokens]
+
         # Random selection
         selected = random.choice(available_tokens)
+        self._last_filter_report["selected_token_id"] = selected.id
         debug_logger.log_info(f"[LOAD_BALANCER] ✅ 已选择Token {selected.id} ({selected.email}) - 余额: {selected.credits}")
         return selected

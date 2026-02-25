@@ -104,12 +104,21 @@ async def lifespan(app: FastAPI):
         
         if resident_project_id:
             # 直接启动常驻模式（会自动导航到项目页面，cookie已持久化）
-            await browser_service.start_resident_mode(resident_project_id)
-            print(f"✓ Browser captcha resident mode started (project: {resident_project_id[:8]}...)")
+            try:
+                await browser_service.start_resident_mode(resident_project_id)
+                print(f"✓ Browser captcha resident mode started (project: {resident_project_id[:8]}...)")
+            except Exception as e:
+                # 容器/root 环境下浏览器初始化可能失败，不应阻断 API 服务启动
+                print(f"⚠ Browser captcha resident mode start failed: {e}")
+                print("⚠ Continue startup without resident browser mode")
         else:
             # 没有可用的project_id时，打开登录窗口供用户手动操作
-            await browser_service.open_login_window()
-            print("⚠ No active token with project_id found, opened login window for manual setup")
+            try:
+                await browser_service.open_login_window()
+                print("⚠ No active token with project_id found, opened login window for manual setup")
+            except Exception as e:
+                print(f"⚠ Open login window failed: {e}")
+                print("⚠ Continue startup without browser window")
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)

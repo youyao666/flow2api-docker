@@ -146,6 +146,7 @@ class BrowserCaptchaService:
         self.browser = None
         self._initialized = False
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        self.page_action = "IMAGE_GENERATION"
         self.db = db
         # 持久化 profile 目录
         self.user_data_dir = os.path.join(os.getcwd(), "browser_data")
@@ -347,16 +348,28 @@ class BrowserCaptchaService:
         
         # 尝试注入脚本
         debug_logger.log_info("[BrowserCaptcha] 未检测到 reCAPTCHA，注入脚本...")
-        
-        await tab.evaluate(f"""
-            (() => {{
-                if (document.querySelector('script[src*="recaptcha"]')) return;
-                const script = document.createElement('script');
-                script.src = 'https://www.google.com/recaptcha/api.js?render={self.website_key}';
-                script.async = true;
-                document.head.appendChild(script);
-            }})()
-        """)
+
+        await tab.evaluate(
+            """
+            ([siteKey]) => {
+                try {
+                    const wanted = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(siteKey)}`;
+                    const exists = Array.from(document.querySelectorAll('script[src]')).some(s => {
+                        const src = s.getAttribute('src') || '';
+                        return src.includes('recaptcha/enterprise.js') && src.includes(`render=${encodeURIComponent(siteKey)}`);
+                    });
+                    if (exists) return;
+                    const script = document.createElement('script');
+                    script.src = wanted;
+                    script.async = true;
+                    script.defer = true;
+                    script.crossOrigin = 'anonymous';
+                    document.head.appendChild(script);
+                } catch (e) {}
+            }
+            """,
+            [self.website_key],
+        )
         
         # 等待脚本加载
         await tab.sleep(3)
@@ -378,61 +391,172 @@ class BrowserCaptchaService:
     async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
         """在指定标签页执行 reCAPTCHA 获取 token
         
-        Args:
-            tab: nodriver 标签页对象
-            action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
-            
-        Returns:
-            reCAPTCHA token 或 None
+        兼容性增强：
+        1) 优先动态提取页面内 render key
+        2) 多 key 兜底（动态 key + 默认 key）
+        3) 多 action 兜底（传入 action + 常见备选）
         """
-        # 生成唯一变量名避免冲突
-        ts = int(time.time() * 1000)
-        token_var = f"_recaptcha_token_{ts}"
-        error_var = f"_recaptcha_error_{ts}"
-        
-        execute_script = f"""
-            (() => {{
-                window.{token_var} = null;
-                window.{error_var} = null;
-                
-                try {{
-                    grecaptcha.enterprise.ready(function() {{
-                        grecaptcha.enterprise.execute('{self.website_key}', {{action: '{action}'}})
-                            .then(function(token) {{
-                                window.{token_var} = token;
-                            }})
-                            .catch(function(err) {{
-                                window.{error_var} = err.message || 'execute failed';
-                            }});
-                    }});
-                }} catch (e) {{
-                    window.{error_var} = e.message || 'exception';
-                }}
-            }})()
-        """
-        
-        # 注入执行脚本
-        await tab.evaluate(execute_script)
-        
-        # 轮询等待结果（最多 15 秒）
-        token = None
-        for i in range(30):
-            await tab.sleep(0.5)
-            token = await tab.evaluate(f"window.{token_var}")
-            if token:
-                break
-            error = await tab.evaluate(f"window.{error_var}")
-            if error:
-                debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 错误: {error}")
-                break
-        
-        # 清理临时变量
+        # 先尽量把页面置于“可交互”状态，再提取/执行
         try:
-            await tab.evaluate(f"delete window.{token_var}; delete window.{error_var};")
-        except:
-            pass
-        
-        return token
+            state = await tab.evaluate(
+                """
+                () => {
+                    try { window.focus(); } catch (e) {}
+                    try { document.dispatchEvent(new Event('mousemove')); } catch (e) {}
+                    try { document.dispatchEvent(new Event('visibilitychange')); } catch (e) {}
+                    return {
+                        href: location.href,
+                        ready: document.readyState,
+                        visibility: document.visibilityState,
+                        hasEnterprise: !!(window.grecaptcha && grecaptcha.enterprise),
+                    };
+                }
+                """
+            )
+            href = (state or {}).get('href') or ''
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 页面状态 href={href} ready={state.get('ready')} visibility={state.get('visibility')} hasEnterprise={state.get('hasEnterprise')}"
+            )
+            # 关键诊断：若未停留在 Flow project 页面，token 大概率会被上游判无效
+            if '/fx/tools/flow/project/' not in href:
+                print(f"[BrowserCaptcha][CTX_MISMATCH] unexpected href before execute: {href}")
+                debug_logger.log_warning(f"[BrowserCaptcha] 执行前页面上下文异常: {href}")
+                return None
+        except Exception as e:
+            debug_logger.log_warning(f"[BrowserCaptcha] 读取页面状态失败: {e}")
+
+        # 先动态提取页面中的 render key（避免写死 sitekey 失效）
+        page_key = None
+        try:
+            page_key = await tab.evaluate("""
+                (() => {
+                    try {
+                        const scripts = Array.from(document.querySelectorAll('script[src]'));
+                        for (const s of scripts) {
+                            const src = s.getAttribute('src') || '';
+                            if (src.includes('recaptcha/enterprise.js') && src.includes('render=')) {
+                                const m = src.match(/[?&]render=([^&]+)/);
+                                if (m && m[1]) return decodeURIComponent(m[1]);
+                            }
+                        }
+                    } catch (e) {}
+                    return null;
+                })()
+            """)
+        except Exception:
+            page_key = None
+
+        # key/action 候选（去重并保序）
+        key_candidates = []
+        if page_key:
+            key_candidates.append(page_key)
+        if self.website_key and self.website_key not in key_candidates:
+            key_candidates.append(self.website_key)
+
+        action_candidates = []
+        for candidate in [action, self.page_action, "IMAGE_GENERATION", "VIDEO_GENERATION", "GENERATE", "GENERATION"]:
+            if candidate and candidate not in action_candidates:
+                action_candidates.append(candidate)
+
+        # 尝试不同 key + action 组合
+        for key in key_candidates:
+            # 按 key 确认 enterprise.js 就绪
+            try:
+                is_ready = await tab.evaluate(
+                    "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
+                )
+                if not is_ready:
+                    await tab.evaluate(
+                        """
+                        ([siteKey]) => {
+                            try {
+                                const wanted = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(siteKey)}`;
+                                const exists = Array.from(document.querySelectorAll('script[src]')).some(s => {
+                                    const src = s.getAttribute('src') || '';
+                                    return src.includes('recaptcha/enterprise.js') && src.includes(`render=${encodeURIComponent(siteKey)}`);
+                                });
+                                if (!exists) {
+                                    const script = document.createElement('script');
+                                    script.src = wanted;
+                                    script.async = true;
+                                    script.defer = true;
+                                    document.head.appendChild(script);
+                                }
+                            } catch (e) {}
+                        }
+                        """,
+                        [key],
+                    )
+                    for _ in range(20):
+                        await tab.sleep(0.5)
+                        is_ready = await tab.evaluate(
+                            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
+                        )
+                        if is_ready:
+                            break
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] key={key[:8]}... 就绪检测异常: {e}")
+
+            for action_name in action_candidates:
+                ts = int(time.time() * 1000)
+                token_var = f"_recaptcha_token_{ts}"
+                error_var = f"_recaptcha_error_{ts}"
+
+                execute_script = f"""
+                    (() => {{
+                        window.{token_var} = null;
+                        window.{error_var} = null;
+                        
+                        try {{
+                            grecaptcha.enterprise.ready(function() {{
+                                grecaptcha.enterprise.execute('{key}', {{action: '{action_name}'}})
+                                    .then(function(token) {{
+                                        window.{token_var} = token;
+                                    }})
+                                    .catch(function(err) {{
+                                        window.{error_var} = err.message || 'execute failed';
+                                    }});
+                            }});
+                        }} catch (e) {{
+                            window.{error_var} = e.message || 'exception';
+                        }}
+                    }})()
+                """
+
+                await tab.evaluate(execute_script)
+
+                token = None
+                for _ in range(30):
+                    await tab.sleep(0.5)
+                    token = await tab.evaluate(f"window.{token_var}")
+                    if token and isinstance(token, str) and len(token) > 80:
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] reCAPTCHA token 获取成功 (key={key[:8]}..., action={action_name}, len={len(token)})"
+                        )
+                        try:
+                            await tab.evaluate(f"delete window.{token_var}; delete window.{error_var};")
+                        except:
+                            pass
+                        return token
+                    if token:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] reCAPTCHA 返回疑似无效短 token (key={key[:8]}..., action={action_name}, len={len(token)})"
+                        )
+
+                    error = await tab.evaluate(f"window.{error_var}")
+                    if error:
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] reCAPTCHA 执行失败 (key={key[:8]}..., action={action_name}): {error}"
+                        )
+                        break
+
+                try:
+                    await tab.evaluate(f"delete window.{token_var}; delete window.{error_var};")
+                except:
+                    pass
+
+        debug_logger.log_error("[BrowserCaptcha] 所有 key/action 组合均未能获取到 reCAPTCHA token")
+        return None
 
     # ========== 主要 API ==========
 
@@ -450,6 +574,19 @@ class BrowserCaptchaService:
         Returns:
             reCAPTCHA token字符串，如果获取失败返回None
         """
+        # 每次获取 token 前动态同步打码配置（支持热更新）
+        if self.db:
+            try:
+                captcha_config = await self.db.get_captcha_config()
+                if getattr(captcha_config, "website_key", None):
+                    self.website_key = captcha_config.website_key
+                if getattr(captcha_config, "page_action", None):
+                    self.page_action = captcha_config.page_action
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] 加载 captcha 配置失败: {e}，使用当前内存配置")
+
+        effective_action = action or self.page_action
+
         # 确保浏览器已初始化
         await self.initialize()
         
@@ -463,16 +600,16 @@ class BrowserCaptchaService:
                 resident_info = await self._create_resident_tab(project_id)
                 if resident_info is None:
                     debug_logger.log_warning(f"[BrowserCaptcha] 无法为 project_id={project_id} 创建常驻标签页，fallback 到传统模式")
-                    return await self._get_token_legacy(project_id, action)
+                    return await self._get_token_legacy(project_id, effective_action)
                 self._resident_tabs[project_id] = resident_info
                 debug_logger.log_info(f"[BrowserCaptcha] ✅ 已为 project_id={project_id} 创建常驻标签页 (当前共 {len(self._resident_tabs)} 个)")
         
         # 使用常驻标签页生成 token
         if resident_info and resident_info.recaptcha_ready and resident_info.tab:
             start_time = time.time()
-            debug_logger.log_info(f"[BrowserCaptcha] 从常驻标签页即时生成 token (project: {project_id}, action: {action})...")
+            debug_logger.log_info(f"[BrowserCaptcha] 从常驻标签页即时生成 token (project: {project_id}, action: {effective_action})...")
             try:
-                token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                token = await self._execute_recaptcha_on_tab(resident_info.tab, effective_action)
                 duration_ms = (time.time() - start_time) * 1000
                 if token:
                     debug_logger.log_info(f"[BrowserCaptcha] ✅ Token生成成功（耗时 {duration_ms:.0f}ms）")
@@ -490,7 +627,7 @@ class BrowserCaptchaService:
                     self._resident_tabs[project_id] = resident_info
                     # 重建后立即尝试生成
                     try:
-                        token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                        token = await self._execute_recaptcha_on_tab(resident_info.tab, effective_action)
                         if token:
                             debug_logger.log_info(f"[BrowserCaptcha] ✅ 重建后 Token生成成功")
                             return token
@@ -499,7 +636,7 @@ class BrowserCaptchaService:
         
         # 最终 Fallback: 使用传统模式
         debug_logger.log_warning(f"[BrowserCaptcha] 所有常驻方式失败，fallback 到传统模式 (project: {project_id})")
-        return await self._get_token_legacy(project_id, action)
+        return await self._get_token_legacy(project_id, effective_action)
 
     async def _create_resident_tab(self, project_id: str) -> Optional[ResidentTabInfo]:
         """为指定 project_id 创建常驻标签页
@@ -516,6 +653,22 @@ class BrowserCaptchaService:
             
             # 创建新标签页
             tab = await self.browser.get(website_url, new_tab=True)
+
+            # 页面预热：提高 execute 上下文稳定性
+            try:
+                await tab.sleep(1)
+                await tab.evaluate(
+                    """
+                    () => {
+                        try { window.focus(); } catch (e) {}
+                        try { document.dispatchEvent(new Event('mousemove')); } catch (e) {}
+                        try { document.dispatchEvent(new Event('visibilitychange')); } catch (e) {}
+                        return true;
+                    }
+                    """
+                )
+            except Exception:
+                pass
             
             # 等待页面加载完成
             page_loaded = False
@@ -541,6 +694,15 @@ class BrowserCaptchaService:
                     pass
                 return None
             
+            # 关键诊断：确认未被重定向到登录页等非项目页
+            try:
+                href = await tab.evaluate("location.href")
+                if '/fx/tools/flow/project/' not in (href or ''):
+                    print(f"[BrowserCaptcha][RESIDENT_CTX] unexpected href after load: {href}")
+                    debug_logger.log_warning(f"[BrowserCaptcha] 常驻页上下文异常: {href}")
+            except Exception:
+                pass
+
             # 等待 reCAPTCHA 加载
             recaptcha_ready = await self._wait_for_recaptcha(tab)
             
@@ -600,6 +762,22 @@ class BrowserCaptchaService:
 
             # 新建标签页并访问页面
             tab = await self.browser.get(website_url)
+
+            # 页面预热：提高 execute 上下文稳定性
+            try:
+                await tab.sleep(1)
+                await tab.evaluate(
+                    """
+                    () => {
+                        try { window.focus(); } catch (e) {}
+                        try { document.dispatchEvent(new Event('mousemove')); } catch (e) {}
+                        try { document.dispatchEvent(new Event('visibilitychange')); } catch (e) {}
+                        return true;
+                    }
+                    """
+                )
+            except Exception:
+                pass
 
             # 等待页面完全加载（增加等待时间）
             debug_logger.log_info("[BrowserCaptcha] [Legacy] 等待页面加载...")
